@@ -17,13 +17,10 @@ st.set_page_config(
 
 st.markdown("""
     <style>
-        /* This removes the massive top padding */
         .block-container {
             padding-top: 2.5rem;
             padding-bottom: 5rem;
         }
-        
-        /* Sticky Footer Styling */
         .footer {
             position: fixed;
             left: 0;
@@ -39,8 +36,6 @@ st.markdown("""
             border-top: 1px solid rgba(0, 0, 0, 0.05);
             z-index: 1000;
         }
-
-        /* Dark mode compatibility for footer */
         @media (prefers-color-scheme: dark) {
             .footer {
                 background-color: rgba(14, 17, 23, 0.8);
@@ -73,28 +68,47 @@ def query_ollama(prompt):
         return "AI Error"
 
 def clean_employee_count(text):
-    prompt = f"Extract the single integer number of employees from: '{text[:500]}'. Return ONLY digits (e.g. 5000). If none, return 0."
+    # REDESIGNED LOGIC: Context-Aware Extraction
+    # We force the AI to explain WHY it chose a number, ensuring it's actually for employees.
+    prompt = f"""
+    Analyze this text and identify the total number of EMPLOYEES (workforce size).
+    
+    Text: "{text[:600]}"
+    
+    STRICT RULES:
+    1. Look for numbers near words like "employees", "workforce", "staff", "people".
+    2. IGNORE numbers associated with "reviews", "salaries", "jobs", "locations", "founded", or "year".
+    3. If a range is given (e.g. 5,000-10,000), return the MAXIMUM (10000).
+    4. If the only numbers found are years (2024) or ratings (4.5), return 0.
+    
+    OUTPUT FORMAT:
+    Return ONLY the raw integer. Do not write "approx" or "employees". Just the digits.
+    """
     res = query_ollama(prompt)
-    digits = re.sub(r'\D', '', res)
-    return int(digits) if digits else 0
+    
+    # We grab the first sequence of digits returned by the AI
+    digits = re.findall(r'\d+', res)
+    if digits:
+        return int(digits[0])
+    return 0
 
 def analyze_job(text):
-    # INCREASED TEXT LIMIT TO 12,000 TO CATCH TECH STACKS AT THE BOTTOM
     prompt = f"""
-    You are a data extractor for a job board.
+    You are a data extractor. Analyze this job posting.
     
-    Your job is to analyse the job posting, extract the Top 5 Tech Stack tools and the main Focus (1 sentence).
-    
-    Format:
-    Tech: [Tools]
-    Focus: [Goal]
-
-    CRITICAL INSTRUCTION:
-    If the text contains words like "Sign In", "Create Account", "Verify Password", "Candidate Home", or "My Account" AND lacks a clear job description, it is a Login Wall.
-    In that case, output EXACTLY:
+    CRITICAL:
+    If text contains "Sign In", "Create Account", "Candidate Home" or is a Login Wall:
+    Output EXACTLY:
     Tech: N/A
     Focus: Apply form, check manually
     
+    OTHERWISE, extract data using this STRICT format:
+    Tech: [Tool1, Tool2, Tool3] (Comma separated list ONLY. Do NOT use bullet points, numbering, or newlines.)
+    Focus: [Goal] (One concise sentence. Do not use filler words like "The focus is".)
+    
+    VERY IMPORTANT NOTE: DO NOT ADD ANY OTHER SENTENCES APART FROM THE Tech and Focus!!! 
+    DO NOT ADD JOB DESCRIPTIONS, OR ANY COMMENTS ABOVE OR BELOW THE Tech and Focus!!!
+
     Job Text:
     {text[:12000]}
     """
@@ -102,9 +116,7 @@ def analyze_job(text):
 
 # --- MAIN APP UI ---
 
-# Sidebar Controls
 with st.sidebar:
-    # LOGO
     st.image("assets/logo.svg", width=250)
     st.divider()
 
@@ -125,7 +137,6 @@ with st.sidebar:
         st.info("Run 'ollama serve' in terminal")
         ai_ready = False
 
-# Main Page Header
 st.markdown("""
     <h1 style='margin-bottom: 0px; padding-top: 0px;'>
         ABH Lead Generator
@@ -179,7 +190,6 @@ if start_btn:
         except:
             st.error("Could not type in search bar.")
 
-        status_box.write("⚠️ Checking for Captcha... (Solve it in the browser if you see one!)")
         try:
             page.wait_for_selector('#search', timeout=0)
         except: pass
@@ -221,49 +231,48 @@ if start_btn:
             status_box.write(f"[{idx+1}/{total_leads}] Analyzing **{lead['Company']}**...")
 
             try:
+                # CLEAN URL
+                clean_url = lead['URL']
+                if "/apply" in clean_url:
+                    clean_url = clean_url.split("/apply")[0]
+                    status_box.write(f"    -> 🧹 Cleaned Apply Link")
+                    lead['URL'] = clean_url
+
                 # JITTER
                 time.sleep(random.uniform(1.0, 2.5))
 
-                # VISIT PAGE
-                page.goto(lead['URL'], timeout=15000) # Increased timeout
+                # NAVIGATE
+                page.goto(lead['URL'], timeout=15000)
 
-                # --- FIX 1: SMART WAIT ---
-                # Instead of just sleeping, we wait for the Description Box to be visible.
-                # Workday almost always uses this ID. We give it 6 seconds to appear.
+                # INTELLIGENT WAIT
                 try:
                     page.wait_for_selector('[data-automation-id="jobPostingDescription"]', state="visible", timeout=6000)
                 except:
-                    # If selector not found, maybe it's a different layout. We proceed to fallback.
-                    pass
-
-                # --- FIX 2: SCROLL TO TRIGGER LAZY LOAD ---
-                # We scroll to the bottom to ensure all text is rendered
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(1)
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    time.sleep(1)
 
                 # EXTRACT TEXT
                 text = ""
                 try:
                     text = page.locator('[data-automation-id="jobPostingDescription"]').inner_text()
                 except:
-                    # Fallback: Get body but try to ignore nav bars
                     text = page.inner_text("body")
 
-                # VALIDATION
                 if len(text) < 100 or "Candidate Home" in text[:200] and len(text) < 500:
-                     # If text is suspiciously short, it failed to load.
                      status_box.write("    -> ⚠️ Page didn't load correctly. Skipping.")
                      continue
 
-                # AI ANALYZE
+                # AI ANALYSIS
                 analysis = analyze_job(text)
                 if "INVALID" in analysis:
                     continue
                 lead['Analysis'] = analysis
 
-                # GOOGLE SIZE CHECK
+                # EMPLOYEE COUNT CHECK (Updated Query + Prompt)
                 status_box.write(f"Checking size of {lead['Company']}...")
-                page.goto(f"https://www.google.com/search?q={lead['Company']}+number+of+employees")
+                
+                # UPDATED: Added "number of" to the search query for better accuracy
+                page.goto(f"https://www.google.com/search?q=\"{lead['Company']}\"+number+of+employees")
 
                 try:
                     page.wait_for_selector('#search', timeout=5000)
@@ -282,7 +291,6 @@ if start_btn:
                     table_placeholder.dataframe(df_live, use_container_width=True)
 
             except Exception as e:
-                # print(e) # Debugging only
                 continue
 
         browser.close()
