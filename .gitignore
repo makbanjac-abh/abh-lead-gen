@@ -1,1 +1,4 @@
+chrome_profile/
+__pycache__/
 *.csv
+.DS_Store
