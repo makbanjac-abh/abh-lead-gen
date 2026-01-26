@@ -67,30 +67,46 @@ def query_ollama(prompt):
     except:
         return "AI Error"
 
-def clean_employee_count(text):
-    # REDESIGNED LOGIC: Context-Aware Extraction
-    # We force the AI to explain WHY it chose a number, ensuring it's actually for employees.
+def extract_company_info(text):
     prompt = f"""
-    Analyze this text and identify the total number of EMPLOYEES (workforce size).
+    Analyze this text and extract company details.
     
-    Text: "{text[:600]}"
+    Text: "{text[:4000]}"
     
-    STRICT RULES:
-    1. Look for numbers near words like "employees", "workforce", "staff", "people".
-    2. IGNORE numbers associated with "reviews", "salaries", "jobs", "locations", "founded", or "year".
-    3. If a range is given (e.g. 5,000-10,000), return the MAXIMUM (10000).
-    4. If the only numbers found are years (2024) or ratings (4.5), return 0.
-    
-    OUTPUT FORMAT:
-    Return ONLY the raw integer. Do not write "approx" or "employees". Just the digits.
+    STRICT JSON OUTPUT FORMAT ONLY:
+    {{
+        "Website": "domain.com or N/A",
+        "LinkedIn": "linkedin.com/company/... or N/A",
+        "Industry": "Industry Name or N/A",
+        "Employees": 123 (integer only, 0 if unknown),
+        "Locations": "HQ City, Country; Office 1; Office 2"
+    }}
+
+    RULES:
+    - Return ONLY valid JSON.
+    - If a specific field is not found, use "N/A" (or 0 for Employees).
+    - For Employees: Look for total workforce size. If range (e.g. 50-100), take max.
+    - For Locations: precise cities/countries are best.
     """
     res = query_ollama(prompt)
     
-    # We grab the first sequence of digits returned by the AI
-    digits = re.findall(r'\d+', res)
-    if digits:
-        return int(digits[0])
-    return 0
+    import json
+    try:
+        # Robust JSON extraction using regex
+        # This handles cases where Llama adds "Here is the JSON:" or markdown blocks
+        match = re.search(r'\{.*\}', res, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            return json.loads(json_str)
+        return json.loads(res)
+    except:
+        return {
+            "Website": "N/A",
+            "LinkedIn": "N/A",
+            "Industry": "N/A",
+            "Employees": 0,
+            "Locations": "N/A"
+        }
 
 def analyze_job(text):
     prompt = f"""
@@ -103,11 +119,13 @@ def analyze_job(text):
     Focus: Apply form, check manually
     
     OTHERWISE, extract data using this STRICT format:
+    OTHERWISE, extract data using this STRICT format:
+    Company: [Correct Full Company Name Found in Text] (e.g. "Morgan Stanley" instead of "Ms")
     Tech: [Tool1, Tool2, Tool3] (Comma separated list ONLY. Do NOT use bullet points, numbering, or newlines.)
     Focus: [Goal] (One concise sentence. Do not use filler words like "The focus is".)
     
-    VERY IMPORTANT NOTE: DO NOT ADD ANY OTHER SENTENCES APART FROM THE Tech and Focus!!! 
-    DO NOT ADD JOB DESCRIPTIONS, OR ANY COMMENTS ABOVE OR BELOW THE Tech and Focus!!!
+    VERY IMPORTANT NOTE: DO NOT ADD ANY OTHER SENTENCES APART FROM THE Company, Tech and Focus!!! 
+    DO NOT ADD JOB DESCRIPTIONS, OR ANY COMMENTS ABOVE OR BELOW THE RESULT!!!
 
     Job Text:
     {text[:12000]}
@@ -266,21 +284,70 @@ if start_btn:
                 analysis = analyze_job(text)
                 if "INVALID" in analysis:
                     continue
+                
+                # Extract Real Company Name from Analysis
+                real_company_name = lead['Company'] # Default
+                try:
+                    name_match = re.search(r"Company:\s*(.+)", analysis)
+                    if name_match:
+                        real_company_name = name_match.group(1).strip()
+                        lead['Company'] = real_company_name # Update with verified name
+                        status_box.write(f"    -> 🏷️ Identified Real Name: **{real_company_name}**")
+                except: pass
+                
                 lead['Analysis'] = analysis
 
-                # EMPLOYEE COUNT CHECK (Updated Query + Prompt)
-                status_box.write(f"Checking size of {lead['Company']}...")
+                # ENRICH COMPANY DATA (Deep Scraping)
+                status_box.write(f"Enriching data for {lead['Company']}...")
                 
-                # UPDATED: Added "number of" to the search query for better accuracy
-                page.goto(f"https://www.google.com/search?q=\"{lead['Company']}\"+number+of+employees")
-
+                # 1. Search Google for Website
+                page.goto(f"https://www.google.com/search?q=\"{lead['Company']}\"+official+website")
+                time.sleep(2.0)
+                
+                website_url = "N/A"
                 try:
-                    page.wait_for_selector('#search', timeout=5000)
-                    snippet = page.inner_text("#search")[:1000]
-                    count = clean_employee_count(snippet)
-                except:
-                    count = 0
-                lead['Employees'] = count
+                     # Attempt to find the first organic result
+                     # Ignoring ads/sponsored
+                     first_result = page.locator("#search a h3").first
+                     if first_result.count() > 0:
+                         parent_link = first_result.locator("xpath=..")
+                         website_url = parent_link.get_attribute("href")
+                         status_box.write(f"    -> 🌐 Found Website: {website_url}")
+                except: pass
+                
+                # 2. Visit Website for Ground Truth (if found)
+                company_text_context = ""
+                if website_url != "N/A" and "http" in website_url:
+                    try:
+                        page.goto(website_url, timeout=10000)
+                        time.sleep(2) # Wait for load
+                        company_text_context = page.inner_text("body")[:5000]
+                    except:
+                        status_box.write("    -> ⚠️ Could not load company site. Using Google summary.")
+                
+                # 3. Fallback/Supplement with Google Knowledge
+                if not company_text_context:
+                    page.goto(f"https://www.google.com/search?q=\"{lead['Company']}\"+linkedin+headquarters+industry+number+of+employees")
+                    time.sleep(2)
+                    company_text_context = page.inner_text("body")[:5000]
+
+                # 4. Extract Data
+                info = extract_company_info(company_text_context)
+                
+                lead['Website'] = website_url
+                lead['LinkedIn'] = info.get('LinkedIn', 'N/A')
+                lead['Industry'] = info.get('Industry', 'N/A')
+                
+                # Safe Employee Count Extraction
+                emp = info.get('Employees', 0)
+                if isinstance(emp, int):
+                    lead['Employees'] = emp
+                elif isinstance(emp, str) and emp.isdigit():
+                    lead['Employees'] = int(emp)
+                else:
+                    lead['Employees'] = 0
+                    
+                lead['Locations'] = info.get('Locations', 'N/A')
 
                 processed_data.append(lead)
 
